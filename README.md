@@ -1,72 +1,156 @@
 # pincher-flux-bridge
 
-*Bridge between pincher reflexes and flux-core bytecode IR. Pincher captures intent→action pairs with confidence scores. Flux-core compiles them to portable bytecode. This bridge translates between the two.*
+Bridge between pincher reflex actions (from `.nail` bundles) and flux-core bytecode IR for compilation through the five-layer agent cognition stack.
 
 ## Why This Exists
 
-The five-layer architecture (open-parallel → pincher → flux-core → cuda-oxide → cudaclaw) has a translation gap: pincher speaks in terms of reflexes (stimulus→response pairs with confidence), while flux-core speaks in terms of bytecode (MOVI, ADD, MUL, JMP). This bridge is the translator.
+Pincher produces `.nail` bundles containing *reflexes* — intent→action pairs with confidence scores. These reflexes are fast paths: pattern matches that fire without LLM involvement. But the rest of the agent stack (flux-core) speaks a different language: bytecode IR with stack operations, conditionals, and branching. This crate translates between them.
 
-A pincher reflex like "when temperature > 80°C, activate cooling (confidence: 0.9)" becomes FLUX bytecode that can run on any device — from the agent's local CPU to a remote GPU.
+The bridge is bidirectional: `reflex_to_flux` converts high-confidence reflexes into `FluxIR` instructions (MatchIntent → ConditionalExec → Halt triples), and `flux_to_teach` converts IR back into reflexes for the teach interface. The round-trip is lossless for well-structured IR.
+
+Confidence filtering is the key design choice: only reflexes above a threshold get compiled to IR. Low-confidence reflexes stay in pincher's teach queue, waiting for more evidence. This prevents premature compilation of unreliable patterns.
 
 ## Architecture
 
-```
-Pincher Reflex:                    Flux Bytecode:
-  stimulus: temp > 80              CMP R0, 80
-  response: activate_cooling       MOVI R1, 1
-  confidence: 0.9                  CMPS R2, 0.9  // threshold
-                                   JLT skip
-                                   CALL activate_cooling
-                                   skip: HALT
+```text
+.nail Bundle (from pincher)
+├── Reflex { intent, action, confidence, invoke_count }
+│
+▼  reflex_to_flux(threshold)
+FluxIR Instructions
+├── MatchIntent("list files")           ← Pattern match
+├── ConditionalExec { action, threshold } ← Guard
+├── Halt                                ← End of triple
+├── MatchIntent("delete temp")
+├── ConditionalExec { action, threshold }
+├── Halt
+│
+▼  flux_to_teach()
+Reflexes (for teach interface)
+
+Conversion Fidelity:
+├── total_reflexes
+├── converted
+├── skipped_low_confidence
+├── skipped_unsupported
+└── fidelity_ratio = converted / total
 ```
 
-### Key Types
+### FluxIR Instructions
 
-- **`NailBundle`** — Pincher's representation of a reflex (stimulus, response, confidence).
-- **`FluxIR`** — Flux-core's intermediate representation (operations, operands, labels).
-- **`Bridge`** — Bidirectional converter: NailBundle → FluxIR and FluxIR → NailBundle.
-- **`ConfidenceThreshold`** — Filter: only convert reflexes above this confidence. Low-confidence reflexes are dropped.
-- **`ConversionResult`** — Success with IR, or error with reason (untranslatable stimulus, unsupported response).
+| Instruction | Stack Effect | Purpose |
+|------------|-------------|---------|
+| `Push(Trit)` | +1 | Push constant onto stack |
+| `Add` | −1 | Z₃ addition of top two |
+| `Mul` | −1 | Z₃ multiplication of top two |
+| `Load(name)` | +1 | Load named variable |
+| `Store(name)` | −1 | Store to named variable |
+| `MatchIntent(pattern)` | +1 | String match (0 or 1) |
+| `ConditionalExec { action, threshold }` | −1 | Execute if confidence ≥ threshold |
+| `BranchIf(addr)` | −1 | Jump if top is nonzero |
+| `Halt` | 0 | Stop execution |
+| `Nop` | 0 | Placeholder |
+
+The `MatchIntent → ConditionalExec → Halt` triple is the canonical reflex pattern. Each reflex compiles to exactly three instructions. The `ConditionalExec` guard ensures that compiled reflexes respect the confidence threshold at runtime.
 
 ## Usage
 
 ```rust
 use pincher_flux_bridge::*;
 
-// Create a pincher reflex
-let reflex = NailBundle::new("temp > 80", "activate_cooling", 0.9);
+// Create a nail bundle with reflexes
+let bundle = NailBundle {
+    agent_name: "assistant".into(),
+    reflexes: vec![
+        Reflex {
+            intent: "list files".into(),
+            action: "ls -la".into(),
+            confidence: 0.9,
+            invoke_count: 50,
+        },
+        Reflex {
+            intent: "delete temp".into(),
+            action: "rm /tmp/*".into(),
+            confidence: 0.3, // Below threshold — will be skipped
+            invoke_count: 2,
+        },
+        Reflex {
+            intent: "show status".into(),
+            action: "git status".into(),
+            confidence: 0.85,
+            invoke_count: 30,
+        },
+    ],
+};
 
-// Bridge to flux IR
-let bridge = Bridge::new(ConfidenceThreshold(0.5));
-let result = bridge.to_flux(&reflex);
+// Convert to Flux IR with confidence threshold 0.5
+let (ir, fidelity) = reflex_to_flux(&bundle, 0.5);
+assert_eq!(fidelity.converted, 2);
+assert_eq!(fidelity.skipped_low_confidence, 1);
+assert!((fidelity.fidelity_ratio - 0.667).abs() < 0.01);
 
-match result {
-    ConversionResult::Success(ir) => {
-        println!("Generated {} ops", ir.operations().len());
-        // ir can now be compiled through flux-core → cuda-oxide → GPU
-    }
-    ConversionResult::Filtered => {
-        println!("Confidence too low — reflex dropped");
-    }
-    ConversionResult::Error(reason) => {
-        println!("Can't translate: {}", reason);
-    }
-}
+// IR contains MatchIntent → ConditionalExec → Halt triples
+assert!(ir.contains(&FluxIR::MatchIntent("list files".into())));
+assert!(ir.contains(&FluxIR::MatchIntent("show status".into())));
 
-// Bidirectional: flux IR → pincher reflex
-let roundtrip = bridge.to_nail(&ir).unwrap();
-assert_eq!(roundtrip.stimulus, reflex.stimulus);
+// Convert back to reflexes (round-trip)
+let reflexes = flux_to_teach(&ir);
+assert_eq!(reflexes.len(), 2);
+assert_eq!(reflexes[0].intent, "list files");
+
+// Z₃ arithmetic for ternary logic in the IR
+assert_eq!(z3_add(-1, -1), 1);   // Z₃ wrapping
+assert_eq!(z3_add(1, 1), -1);    // Z₃ wrapping
+assert_eq!(z3_mul(-1, -1), 1);   // Double negative
+assert_eq!(z3_mul(0, 1), 0);     // Zero annihilates
+
+// Perfect fidelity when all reflexes pass threshold
+let perfect = NailBundle {
+    agent_name: "test".into(),
+    reflexes: vec![
+        Reflex { intent: "a".into(), action: "b".into(), confidence: 0.95, invoke_count: 10 },
+        Reflex { intent: "c".into(), action: "d".into(), confidence: 0.88, invoke_count: 5 },
+    ],
+};
+let (_, f) = reflex_to_flux(&perfect, 0.5);
+assert!((f.fidelity_ratio - 1.0).abs() < 1e-10);
 ```
+
+## API Reference
+
+### NailBundle & Reflex
+- `NailBundle { agent_name, reflexes }` — A pincher bundle containing named reflexes
+- `Reflex { intent, action, confidence, invoke_count }` — A single intent→action mapping with reliability metrics
+
+### FluxIR (Enum)
+- `Push(Trit)` / `Add` / `Mul` — Stack operations using Z₃ arithmetic
+- `Load(String)` / `Store(String)` — Named variable access
+- `MatchIntent(String)` — Pattern match against intent string, pushes 0 or 1
+- `ConditionalExec { action: String, threshold: f64 }` — Execute action if top-of-stack confidence ≥ threshold
+- `BranchIf(usize)` / `Halt` / `Nop` — Control flow
+
+### Conversion Functions
+- `reflex_to_flux(bundle, confidence_threshold)` → `(Vec<FluxIR>, ConversionFidelity)` — Compile reflexes above threshold into IR triples
+- `flux_to_teach(instructions)` → `Vec<Reflex>` — Decompile IR back to reflexes (round-trip)
+
+### ConversionFidelity
+- `ConversionFidelity { total_reflexes, converted, skipped_low_confidence, skipped_unsupported, fidelity_ratio }` — Metrics on what made it through
+- `ConversionFidelity::perfect(n)` — Construct a perfect (100%) result for n reflexes
+
+### Z₃ Arithmetic
+- `z3_add(a, b)` → `Trit` — Z₃ addition (explicit 9-case match for correctness)
+- `z3_mul(a, b)` → `Trit` — Z₃ multiplication (sign product)
 
 ## The Deeper Idea
 
-This bridge is where the five-layer stack stops being five separate projects and becomes one system. Without it, pincher reflexes are trapped in pincher's runtime. With it, they become portable bytecode that can run on GPUs, ESP32s, or anywhere FLUX runs.
+This crate sits at the boundary between two representations: pincher's reflex-based pattern matching and flux-core's stack-based bytecode. Reflexes are fast but rigid — they match exactly the patterns they were taught. Flux IR is flexible and compositional — you can combine instructions to build complex behaviors. The bridge lets reflexes *graduate* into compiled IR once they've proven reliable (high confidence, many invocations).
 
-The confidence thresholding is the interesting design decision. Not every reflex deserves compilation — low-confidence reflexes are essentially noise. By filtering at the bridge, we ensure that only well-established reflexes consume compilation and execution resources. This is the same principle as `agent-intonation`'s accuracy requirements: only well-tuned behaviors get promoted.
+The confidence threshold is the gatekeeper. A reflex with 0.3 confidence and 2 invocations hasn't earned compilation — it's still experimental. A reflex with 0.9 confidence and 50 invocations has proven itself and deserves the speed of compiled IR. This is how agent cognition scales: fast paths for proven behaviors, fallback for novel ones.
+
+The Z₃ arithmetic in FluxIR enables ternary logic operations within the bytecode. Stack-based ternary computation allows the IR to express conditions like "if the majority of voices agree, execute" — the same ternary consensus used throughout the ecosystem.
 
 ## Related Crates
 
-- `pincher` — The hermit crab agent that produces reflexes
-- `flux-core` — The FLUX runtime that executes the compiled IR
-- `cuda-oxide` — FLUX → PTX compilation for GPU
-- `intent-flux-bridge` — Similar bridge for intent-based (not reflex-based) compilation
+- [`character-sheet`](../character-sheet) — The `.nail` bundle format that pincher produces
+- [`character-encounter`](../character-encounter) — The encounter engine that runs compiled reflexes
+- [`ternary-cuda-kernels`](../ternary-cuda-kernels) — GPU acceleration for ternary operations in the IR
